@@ -19,7 +19,8 @@ class SindhiTextSegmenter:
                  line_padding=20, word_padding=10, letter_padding=7,
                  output_height=64, output_width=None,
                  denoise_strength=10, morph_kernel_size=2,
-                 auto_deskew=True, skew_threshold=0.5):
+                 auto_deskew=True, skew_threshold=0.5,
+                 min_text_pixels=50, text_threshold=0.05):
         """
         Initialize the segmenter optimized for Sindhi script
         
@@ -35,6 +36,8 @@ class SindhiTextSegmenter:
             morph_kernel_size: Morphological operation kernel size
             auto_deskew: Automatically detect and correct skew
             skew_threshold: Minimum skew angle to correct (in degrees)
+            min_text_pixels: Minimum number of text pixels to consider valid
+            text_threshold: Minimum ratio of text pixels to total pixels (0.01-0.1)
         """
         self.image_path = image_path
         self.output_dir = output_dir
@@ -47,6 +50,8 @@ class SindhiTextSegmenter:
         self.morph_kernel_size = morph_kernel_size
         self.auto_deskew = auto_deskew
         self.skew_threshold = skew_threshold
+        self.min_text_pixels = min_text_pixels
+        self.text_threshold = text_threshold
         
         self.image = None
         self.gray = None
@@ -56,6 +61,41 @@ class SindhiTextSegmenter:
         
         # Create output directories
         self._create_directories()
+    
+    def has_sufficient_text(self, image, binary_image=None):
+        """
+        Check if image has sufficient text content
+        Returns True if image contains meaningful text, False if empty/background
+        
+        Args:
+            image: Color or grayscale image
+            binary_image: Pre-computed binary image (optional)
+        """
+        # Convert to grayscale if needed
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+        
+        # Use provided binary or create one
+        if binary_image is None:
+            # Quick thresholding for checking
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        else:
+            binary = binary_image
+        
+        # Count text pixels (white pixels in binary)
+        text_pixels = np.sum(binary > 0)
+        total_pixels = binary.shape[0] * binary.shape[1]
+        
+        # Calculate text ratio
+        text_ratio = text_pixels / total_pixels if total_pixels > 0 else 0
+        
+        # Check both absolute count and ratio
+        has_text = (text_pixels >= self.min_text_pixels and 
+                   text_ratio >= self.text_threshold)
+        
+        return has_text, text_pixels, text_ratio
         
     def _create_directories(self):
         """Create output directory structure"""
@@ -334,18 +374,31 @@ class SindhiTextSegmenter:
         
         # Save line images
         line_images = []
+        saved_lines = 0
+        skipped_lines = 0
+        
         for idx, (start, end) in enumerate(lines):
             line_img = self.image[start:end, :]
             line_binary = self.processed[start:end, :]
             
+            # Check if line has sufficient text
+            has_text, text_pixels, text_ratio = self.has_sufficient_text(
+                line_img, line_binary
+            )
+            
+            if not has_text:
+                skipped_lines += 1
+                continue
+            
             # Resize if specified
             line_img_resized = self.resize_image(line_img)
             
-            cv2.imwrite(f"{self.output_dir}/lines/line_{idx:03d}.png", 
+            cv2.imwrite(f"{self.output_dir}/lines/line_{saved_lines:03d}.png", 
                        line_img_resized)
-            line_images.append((line_binary, line_img, idx))
+            line_images.append((line_binary, line_img, saved_lines))
+            saved_lines += 1
         
-        print(f"✓ Segmented {len(lines)} lines")
+        print(f"✓ Segmented {saved_lines} lines (skipped {skipped_lines} empty)")
         return line_images
     
     def segment_words_or_ligatures(self, line_images, min_width=5):
@@ -355,6 +408,7 @@ class SindhiTextSegmenter:
         """
         all_words = []
         word_count = 0
+        skipped_words = 0
         
         for line_binary, line_color, line_idx in line_images:
             # Vertical projection
@@ -398,8 +452,18 @@ class SindhiTextSegmenter:
             # Save word/ligature images
             for w_idx, (start, end) in enumerate(words):
                 word_img = line_color[:, start:end]
+                word_binary = line_binary[:, start:end]
                 
                 if word_img.shape[0] > 5 and word_img.shape[1] > 5:
+                    # Check if word has sufficient text
+                    has_text, text_pixels, text_ratio = self.has_sufficient_text(
+                        word_img, word_binary
+                    )
+                    
+                    if not has_text:
+                        skipped_words += 1
+                        continue
+                    
                     word_img_resized = self.resize_image(word_img)
                     
                     filename = f"word_{word_count:04d}_line{line_idx}.png"
@@ -407,14 +471,14 @@ class SindhiTextSegmenter:
                               word_img_resized)
                     
                     all_words.append((
-                        line_binary[:, start:end], 
+                        word_binary, 
                         word_img, 
                         word_count, 
                         line_idx
                     ))
                     word_count += 1
         
-        print(f"✓ Segmented {word_count} words/ligatures")
+        print(f"✓ Segmented {word_count} words/ligatures (skipped {skipped_words} empty)")
         return all_words
     
     def segment_ligatures_advanced(self, word_images, min_area=25):
@@ -423,6 +487,7 @@ class SindhiTextSegmenter:
         Uses connected components with proper handling of dots and diacritics
         """
         ligature_count = 0
+        skipped_ligatures = 0
         
         for word_binary, word_color, word_idx, line_idx in word_images:
             h, w = word_binary.shape
@@ -462,8 +527,22 @@ class SindhiTextSegmenter:
                 y2 = min(word_color.shape[0], y_max + self.letter_padding)
                 
                 ligature_img = word_color[y1:y2, x1:x2]
+                ligature_binary = word_binary[y1:y2, x1:x2]
                 
                 if ligature_img.shape[0] > 5 and ligature_img.shape[1] > 5:
+                    # More lenient checking for ligatures (they're smaller)
+                    # Use much lower thresholds since ligatures can be small
+                    text_pixels = np.sum(ligature_binary > 0)
+                    total_pixels = ligature_binary.shape[0] * ligature_binary.shape[1]
+                    text_ratio = text_pixels / total_pixels if total_pixels > 0 else 0
+                    
+                    # Very lenient thresholds for ligatures
+                    has_text = (text_pixels >= 10 and text_ratio >= 0.01)
+                    
+                    if not has_text:
+                        skipped_ligatures += 1
+                        continue
+                    
                     ligature_img_resized = self.resize_image(ligature_img)
                     
                     filename = f"lig_{ligature_count:05d}_w{word_idx}_l{line_idx}.png"
@@ -471,7 +550,7 @@ class SindhiTextSegmenter:
                               ligature_img_resized)
                     ligature_count += 1
         
-        print(f"✓ Segmented {ligature_count} ligatures/characters")
+        print(f"✓ Segmented {ligature_count} ligatures/characters (skipped {skipped_ligatures} empty)")
         return ligature_count
     
     def _group_components(self, components, width, max_gap=15):
@@ -581,7 +660,9 @@ if __name__ == "__main__":
         denoise_strength=12,   # Noise reduction
         morph_kernel_size=2,   # Connect broken characters
         auto_deskew=True,      # Enable automatic skew correction
-        skew_threshold=0.5     # Minimum angle to correct (degrees)
+        skew_threshold=0.5,    # Minimum angle to correct (degrees)
+        min_text_pixels=50,    # Minimum text pixels to keep segment
+        text_threshold=0.05    # Minimum text ratio (5% of pixels)
     )
     
     # For word-level segmentation (recommended)
